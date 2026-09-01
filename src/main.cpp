@@ -12,12 +12,16 @@
 
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <netinet/in.h>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -46,6 +50,15 @@ const char *kTalkSelect =
     "COALESCE(array_to_json(topics), '[]'::json)::text AS topics";
 
 std::string g_dsn;
+
+constexpr int kPoolSize = 8;
+std::mutex g_db_mu;
+std::condition_variable g_db_cv;
+PGconn *g_pool[kPoolSize]{};
+bool g_busy[kPoolSize]{};
+int g_sql_count = 0;
+int g_connect_count = 0;
+PGconn *(*g_connect_fn)(const char *) = nullptr;
 
 std::string env_or(const char *key, const char *fallback) {
   const char *v = std::getenv(key);
@@ -131,14 +144,74 @@ const char *kEndpointsJson =
     "{\"method\":\"GET\",\"path\":\"/v1/sponsors/:year/:slug\",\"query\":[]}"
     "]";
 
+bool conn_ok(PGconn *c) {
+  if (!c) return false;
+  if (g_connect_fn) return true;
+  return PQstatus(c) == CONNECTION_OK;
+}
+
+PGconn *do_connect() {
+  g_connect_count++;
+  if (g_connect_fn) return g_connect_fn(g_dsn.c_str());
+  return PQconnectdb(g_dsn.c_str());
+}
+
+PGconn *db_acquire() {
+  std::unique_lock<std::mutex> lock(g_db_mu);
+  for (;;) {
+    int busy = 0;
+    for (int i = 0; i < kPoolSize; ++i) {
+      if (g_busy[i]) {
+        busy++;
+        continue;
+      }
+      if (!conn_ok(g_pool[i])) {
+        if (g_pool[i] && !g_connect_fn) PQfinish(g_pool[i]);
+        g_pool[i] = do_connect();
+      }
+      if (conn_ok(g_pool[i])) {
+        g_busy[i] = true;
+        return g_pool[i];
+      }
+      g_pool[i] = nullptr;
+    }
+    if (busy == 0) return nullptr;
+    g_db_cv.wait(lock);
+  }
+}
+
+void db_release(PGconn *c) {
+  if (!c) return;
+  std::lock_guard<std::mutex> lock(g_db_mu);
+  for (int i = 0; i < kPoolSize; ++i) {
+    if (g_pool[i] == c) {
+      g_busy[i] = false;
+      break;
+    }
+  }
+  g_db_cv.notify_one();
+}
+
+void db_reset_pool() {
+  std::lock_guard<std::mutex> lock(g_db_mu);
+  for (int i = 0; i < kPoolSize; ++i) {
+    if (g_pool[i] && !g_connect_fn) PQfinish(g_pool[i]);
+    g_pool[i] = nullptr;
+    g_busy[i] = false;
+  }
+}
+
 struct Conn {
   PGconn *c;
-  explicit Conn() : c(PQconnectdb(g_dsn.c_str())) {}
-  ~Conn() {
-    if (c) PQfinish(c);
+  Conn() : c(db_acquire()) {}
+  ~Conn() { db_release(c); }
+  Conn(const Conn &) = delete;
+  Conn &operator=(const Conn &) = delete;
+  bool ok() const { return conn_ok(c); }
+  const char *err() const {
+    if (g_connect_fn) return "connect failed";
+    return c ? PQerrorMessage(c) : "connect failed";
   }
-  bool ok() const { return c && PQstatus(c) == CONNECTION_OK; }
-  const char *err() const { return c ? PQerrorMessage(c) : "no connection"; }
 };
 
 struct Res {
@@ -159,6 +232,7 @@ struct Res {
 };
 
 Res exec_params(PGconn *c, const char *sql, const std::vector<std::string> &params) {
+  g_sql_count++;
   std::vector<const char *> vals;
   vals.reserve(params.size());
   for (const auto &p : params) vals.push_back(p.c_str());
@@ -283,6 +357,118 @@ std::vector<int> talk_years(PGconn *c, const std::string &slug) {
   return years;
 }
 
+Talks talk_row(PGresult *r, int i) {
+  Talks t;
+  auto lang = parse_json_str_array(col(r, i, "languages"));
+  auto top = parse_json_str_array(col(r, i, "topics"));
+  t.languages = lang;
+  t.topics = top;
+  t.items.push_back(J::obj({
+      {"slug", J::s(col(r, i, "slug"))},
+      {"title", J::s(col(r, i, "title"))},
+      {"description", J::s(col(r, i, "description"))},
+      {"format", J::s(col(r, i, "format"))},
+      {"youtube_id", J::s(col(r, i, "youtube_id"))},
+      {"year", J::i(as_int(col(r, i, "year")))},
+      {"speaker_slug", J::s(col(r, i, "speaker_slug"))},
+      {"languages", J::strs(lang)},
+      {"topics", J::strs(top)},
+  }));
+  return t;
+}
+
+void merge_talk(Talks &dst, Talks &&src) {
+  dst.items.insert(dst.items.end(), src.items.begin(), src.items.end());
+  dst.languages.insert(dst.languages.end(), src.languages.begin(), src.languages.end());
+  dst.topics.insert(dst.topics.end(), src.topics.begin(), src.topics.end());
+}
+
+std::unordered_map<std::string, Talks> load_talks_for_year(PGconn *c, int year) {
+  std::string sql = std::string("SELECT ") + kTalkSelect +
+                    " FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC";
+  Res res = exec_params(c, sql.c_str(), {std::to_string(year)});
+  std::unordered_map<std::string, Talks> by_slug;
+  if (!res.ok()) return by_slug;
+  for (int i = 0; i < res.n(); ++i) {
+    const char *slug = col(res.r, i, "speaker_slug");
+    if (!slug) continue;
+    merge_talk(by_slug[slug], talk_row(res.r, i));
+  }
+  for (auto &kv : by_slug) {
+    kv.second.languages = uniq(kv.second.languages);
+    kv.second.topics = uniq(kv.second.topics);
+  }
+  return by_slug;
+}
+
+std::string pg_text_array(const std::vector<std::string> &slugs) {
+  std::string arr = "{";
+  for (size_t i = 0; i < slugs.size(); ++i) {
+    if (i) arr += ',';
+    arr += '"';
+    arr += slugs[i];
+    arr += '"';
+  }
+  arr += '}';
+  return arr;
+}
+
+std::unordered_map<std::string, std::vector<int>> load_years_for_slugs(PGconn *c,
+                                                                      const std::vector<std::string> &slugs) {
+  std::unordered_map<std::string, std::vector<int>> by_slug;
+  if (slugs.empty()) return by_slug;
+  Res res = exec_params(c,
+                        "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1::text[]) "
+                        "ORDER BY speaker_slug, year DESC",
+                        {pg_text_array(slugs)});
+  if (!res.ok()) return by_slug;
+  for (int i = 0; i < res.n(); ++i) {
+    const char *slug = col(res.r, i, "speaker_slug");
+    if (!slug) continue;
+    by_slug[slug].push_back(as_int(col(res.r, i, "year")));
+  }
+  return by_slug;
+}
+
+J speaker_with_year(PGresult *r, int row, int y, const Talks &talks, const std::vector<int> &years) {
+  std::string s = speaker_obj(r, row).raw;
+  if (!s.empty() && s.back() == '}') s.pop_back();
+  s += ",\"year\":" + std::to_string(y);
+  s += ",\"talks\":" + J::arr(talks.items).raw;
+  s += ",\"languages\":" + J::strs(talks.languages).raw;
+  s += ",\"topics\":" + J::strs(talks.topics).raw;
+  s += ",\"years\":" + J::ints(years).raw;
+  s += "}";
+  return J::raw_json(std::move(s));
+}
+
+bool list_speakers_year(PGconn *c, int y, std::vector<J> &rows) {
+  std::string sql = std::string("SELECT ") + kSpeakerCols +
+                    " FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) "
+                    "ORDER BY last_name, first_name";
+  Res q = exec_params(c, sql.c_str(), {std::to_string(y)});
+  if (!q.ok()) return false;
+  std::vector<std::string> slugs;
+  slugs.reserve(static_cast<size_t>(q.n()));
+  for (int i = 0; i < q.n(); ++i) {
+    const char *slug = col(q.r, i, "slug");
+    slugs.push_back(slug ? slug : "");
+  }
+  auto talks_by = load_talks_for_year(c, y);
+  auto years_by = load_years_for_slugs(c, slugs);
+  rows.clear();
+  rows.reserve(static_cast<size_t>(q.n()));
+  Talks empty_talks;
+  std::vector<int> empty_years;
+  for (int i = 0; i < q.n(); ++i) {
+    const std::string &slug = slugs[static_cast<size_t>(i)];
+    const Talks &talks = talks_by.count(slug) ? talks_by[slug] : empty_talks;
+    const std::vector<int> &years = years_by.count(slug) ? years_by[slug] : empty_years;
+    rows.push_back(speaker_with_year(q.r, i, y, talks, years));
+  }
+  return true;
+}
+
 std::vector<int> sponsor_years(PGconn *c, const std::string &slug) {
   Res res = exec_params(c,
                         "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC",
@@ -366,6 +552,8 @@ J wrap_data(const std::vector<J> &rows) { return J::obj({{"data", J::arr(rows)}}
 
 J wrap_data(J row) { return J::obj({{"data", std::move(row)}}); }
 
+J health_json() { return J::obj({{"ok", J::b(true)}}); }
+
 J identity() {
   return J::obj({
       {"language", J::s(kLanguage)},
@@ -382,31 +570,93 @@ void register_with_elixir(const std::string &port) {
   const char *url = std::getenv("CAROLINA_URL");
   const char *token = std::getenv("POLYGLOT_REGISTER_TOKEN");
   if (!url || !*url || !token || !*token) return;
-  std::string base = env_or("PUBLIC_BASE_URL", ("http://127.0.0.1:" + port).c_str());
-  J body = J::obj({
-      {"language", J::s(kLanguage)},
-      {"language_version", J::s(kLanguageVersion)},
-      {"api_version", J::s(kApiVersion)},
-      {"framework", J::s(kFramework)},
-      {"created_year", J::i(kCreatedYear)},
-      {"schema_version", J::i(kSchemaVersion)},
-      {"base_url", J::s(base)},
-      {"endpoints", J::raw_json(kEndpointsJson)},
-  });
-  httplib::Headers headers{{"Authorization", std::string("Bearer ") + token}};
-  httplib::Client cli(url);
-  cli.set_connection_timeout(5, 0);
-  cli.set_read_timeout(5, 0);
-  auto resp = cli.Post("/internal/api-endpoints/register", headers, body.raw, "application/json");
-  if (resp) {
-    std::cerr << "registered with elixir: " << resp->status << "\n";
-  } else {
-    std::cerr << "register: " << httplib::to_string(resp.error()) << "\n";
+  try {
+    std::string origin = url;
+    // cpp-httplib is built without OpenSSL; Fly 6PN HTTP is enough to register.
+    if (origin.rfind("https://", 0) == 0) {
+      origin = "http://carolina-codes.internal:8080";
+    }
+    std::string base = env_or("PUBLIC_BASE_URL", ("http://127.0.0.1:" + port).c_str());
+    J body = J::obj({
+        {"language", J::s(kLanguage)},
+        {"language_version", J::s(kLanguageVersion)},
+        {"api_version", J::s(kApiVersion)},
+        {"framework", J::s(kFramework)},
+        {"created_year", J::i(kCreatedYear)},
+        {"schema_version", J::i(kSchemaVersion)},
+        {"base_url", J::s(base)},
+        {"endpoints", J::raw_json(kEndpointsJson)},
+    });
+    httplib::Headers headers{{"Authorization", std::string("Bearer ") + token}};
+    httplib::Client cli(origin);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+    auto resp = cli.Post("/internal/api-endpoints/register", headers, body.raw, "application/json");
+    if (resp) {
+      std::cerr << "registered with elixir: " << resp->status << "\n";
+    } else {
+      std::cerr << "register: " << httplib::to_string(resp.error()) << "\n";
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "register: " << e.what() << "\n";
   }
 }
 
 }  // namespace
 
+void carolina_init() {
+  g_dsn = env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
+}
+
+void carolina_reset_counts() {
+  g_sql_count = 0;
+  g_connect_count = 0;
+}
+
+int carolina_sql_count() { return g_sql_count; }
+
+int carolina_connect_count() { return g_connect_count; }
+
+void carolina_set_connect_fn(PGconn *(*fn)(const char *)) {
+  db_reset_pool();
+  g_connect_fn = fn;
+}
+
+PGconn *carolina_db_acquire() { return db_acquire(); }
+
+void carolina_db_release(PGconn *c) { db_release(c); }
+
+int carolina_listen_family() { return AF_INET6; }
+
+int carolina_handle_health_copy(char *buf, size_t buflen) {
+  J body = health_json();
+  if (buf && buflen) std::snprintf(buf, buflen, "%s", body.raw.c_str());
+  return 200;
+}
+
+int carolina_handle_speakers_year(int year, char *buf, size_t buflen) {
+  Conn db;
+  if (!db.ok()) {
+    if (buf && buflen) std::snprintf(buf, buflen, "%s", "{\"error\":\"connect failed\"}");
+    return 500;
+  }
+  std::vector<J> rows;
+  if (!list_speakers_year(db.c, year, rows)) {
+    if (buf && buflen) std::snprintf(buf, buflen, "%s", "{\"error\":\"query failed\"}");
+    return 500;
+  }
+  J payload = wrap_data(rows);
+  if (buf && buflen) std::snprintf(buf, buflen, "%s", payload.raw.c_str());
+  return 200;
+}
+
+int carolina_bind_ipv6() {
+  httplib::Server svr;
+  int port = svr.bind_to_port("::", 0);
+  return port;
+}
+
+#ifndef CAROLINA_TEST
 int main() {
   g_dsn = env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
   std::string port_s = env_or("PORT", "4009");
@@ -426,9 +676,7 @@ int main() {
   });
 
   svr.Get("/", [](const httplib::Request &, httplib::Response &res) { send_json(res, identity()); });
-  svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
-    send_json(res, J::obj({{"ok", J::b(true)}}));
-  });
+  svr.Get("/health", [](const httplib::Request &, httplib::Response &res) { send_json(res, health_json()); });
 
   svr.Get("/v1/years", [](const httplib::Request &, httplib::Response &res) {
     Conn db;
@@ -453,30 +701,8 @@ int main() {
     std::string year = req.get_param_value("year");
     if (!year.empty()) {
       int y = std::atoi(year.c_str());
-      std::string sql = std::string("SELECT ") + kSpeakerCols +
-                        " FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) "
-                        "ORDER BY last_name, first_name";
-      Res q = exec_params(db.c, sql.c_str(), {std::to_string(y)});
-      if (!q.ok()) return send_error(res, 500, q.err());
       std::vector<J> rows;
-      for (int i = 0; i < q.n(); ++i) {
-        std::string slug = col(q.r, i, "slug") ? col(q.r, i, "slug") : "";
-        Talks talks = load_talks(db.c, slug, &y);
-        auto years = talk_years(db.c, slug);
-        auto base = speaker_obj(q.r, i);
-        // rebuild with extras
-        rows.push_back(J::raw_json([&] {
-          std::string s = base.raw;
-          if (!s.empty() && s.back() == '}') s.pop_back();
-          s += ",\"year\":" + std::to_string(y);
-          s += ",\"talks\":" + J::arr(talks.items).raw;
-          s += ",\"languages\":" + J::strs(talks.languages).raw;
-          s += ",\"topics\":" + J::strs(talks.topics).raw;
-          s += ",\"years\":" + J::ints(years).raw;
-          s += "}";
-          return s;
-        }()));
-      }
+      if (!list_speakers_year(db.c, y, rows)) return send_error(res, 500, "query failed");
       return send_json(res, wrap_data(rows));
     }
     std::string sql = std::string("SELECT ") + kSpeakerCols + " FROM v1_speakers ORDER BY last_name, first_name";
@@ -590,9 +816,10 @@ int main() {
   }).detach();
 
   std::cerr << "carolina-codes-cpp listening on :" << port << "\n";
-  if (!svr.listen("0.0.0.0", port)) {
+  if (!svr.listen("::", port)) {
     std::cerr << "listen failed\n";
     return 1;
   }
   return 0;
 }
+#endif
