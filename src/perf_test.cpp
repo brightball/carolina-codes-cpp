@@ -146,6 +146,26 @@ static bool job_has_needs(const std::string &body) {
   return false;
 }
 
+static bool job_needs_prepare(const std::string &body) {
+  for (const auto &line : split_lines(body)) {
+    auto trimmed = line;
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) trimmed.erase(trimmed.begin());
+    if (trimmed.rfind("needs:", 0) == 0 && trimmed.find("prepare") != std::string::npos) return true;
+  }
+  return false;
+}
+
+static bool contains_shared_tool_install(const std::string &text) {
+  if (text.find("apt-get install") != std::string::npos) return true;
+  if (text.find("libpq-dev") != std::string::npos) return true;
+  if (text.find("cppcheck") != std::string::npos) return true;
+  if (text.find("osv-scanner_linux_amd64") != std::string::npos) return true;
+  if (text.find("gitleaks_8.30.1") != std::string::npos) return true;
+  if (text.find("pip3 install") != std::string::npos) return true;
+  if (text.find("clang-format==") != std::string::npos) return true;
+  return false;
+}
+
 static void expect_contains(const std::string &text, const char *needle, const char *msg) {
   expect(text.find(needle) != std::string::npos, msg);
 }
@@ -183,14 +203,48 @@ static void test_quality_gate_wiring() {
   auto jobs = parse_gitea_jobs(workflow);
   const char *kinds[] = {"test", "sast", "vuln", "secrets", "fmt"};
   const char *makes[] = {"make test", "make sast", "make vuln", "make secrets", "make fmt-check"};
-  expect(jobs.size() >= 5, "Gitea workflow has five separate check jobs");
+  expect(jobs.count("prepare") == 1, "Gitea workflow has an initial prepare job");
+  expect(jobs.size() >= 6, "Gitea workflow has prepare plus five separate check jobs");
+  if (jobs.count("prepare")) {
+    const std::string &prep = jobs["prepare"];
+    expect(!job_has_needs(prep), "prepare job is the initial stage");
+    expect_contains(prep, "apt-get install", "prepare job apt-installs the shared toolset");
+    expect_contains(prep, "libpq-dev", "prepare job installs libpq");
+    expect_contains(prep, "cppcheck", "prepare job installs cppcheck");
+    expect_contains(prep, "osv-scanner_linux_amd64", "prepare job downloads osv-scanner");
+    expect_contains(prep, "gitleaks_8.30.1", "prepare job downloads gitleaks");
+    expect_contains(prep, "pip3 install", "prepare job pip-installs clang-format");
+    expect_contains(prep, "clang-format==", "prepare job pins clang-format");
+    expect_contains(prep, "ci-pack.sh", "prepare job packs the CI environment");
+    expect_contains(prep, "ci-artifact.sh", "prepare job publishes the CI environment");
+    expect_contains(prep, "x-access-token", "prepare job clones with job token over HTTPS");
+    expect_contains(prep, "GITHUB_SHA", "prepare job checks out GITHUB_SHA");
+    expect(prep.find("git clone") != std::string::npos, "prepare job clones over HTTPS");
+    expect(prep.find("make test") == std::string::npos, "prepare job is not a combined check");
+  }
+
+  const std::string restore = slurp_file("scripts/ci-restore.sh");
+  const std::string pack = slurp_file("scripts/ci-pack.sh");
+  const std::string artifact = slurp_file("scripts/ci-artifact.sh");
+  expect(restore.find("dpkg") != std::string::npos, "restore extracts packed debs with dpkg");
+  expect(restore.find("usr-local") != std::string::npos, "restore copies packed /usr/local tools");
+  expect(restore.find("apt-get install") == std::string::npos, "restore does not apt-get install the toolset");
+  expect(restore.find("osv-scanner_linux_amd64") == std::string::npos, "restore does not download osv-scanner");
+  expect(restore.find("gitleaks_8.30.1") == std::string::npos, "restore does not download gitleaks");
+  expect(restore.find("pip3 install") == std::string::npos, "restore does not pip-install clang-format");
+  expect_contains(pack, "/var/cache/apt/archives", "pack captures apt debs");
+  expect_contains(pack, "/usr/local", "pack captures /usr/local tools");
+  expect_contains(artifact, "actions_pipeline", "artifact helper uses Gitea pipeline API");
+  expect(artifact.find("actions/upload-artifact") == std::string::npos, "artifact helper is not a Node upload action");
+  expect(artifact.find("actions/download-artifact") == std::string::npos, "artifact helper is not a Node download action");
+
   for (int i = 0; i < 5; ++i) {
     std::string present = std::string("Gitea job exists: ") + kinds[i];
     expect(jobs.count(kinds[i]) == 1, present.c_str());
     if (!jobs.count(kinds[i])) continue;
     const std::string &body = jobs[kinds[i]];
-    std::string no_needs = std::string("Gitea job has no needs: ") + kinds[i];
-    expect(!job_has_needs(body), no_needs.c_str());
+    std::string needs_prep = std::string("Gitea job needs prepare: ") + kinds[i];
+    expect(job_needs_prepare(body), needs_prep.c_str());
     std::string has_make = std::string("Gitea job runs its check: ") + kinds[i];
     expect(body.find(makes[i]) != std::string::npos, has_make.c_str());
     for (int j = 0; j < 5; ++j) {
@@ -200,6 +254,9 @@ static void test_quality_gate_wiring() {
     expect_contains(body, "x-access-token", "check job clones with job token over HTTPS");
     expect_contains(body, "GITHUB_SHA", "check job checks out GITHUB_SHA");
     expect(body.find("git clone") != std::string::npos, "check job clones over HTTPS");
+    expect_contains(body, "ci-restore.sh", "check job restores the prepared environment");
+    std::string no_install = std::string("check job does not reinstall shared tools: ") + kinds[i];
+    expect(!contains_shared_tool_install(body), no_install.c_str());
   }
 }
 
