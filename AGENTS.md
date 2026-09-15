@@ -2,6 +2,8 @@
 
 Read-only v1 polyglot API. See README.md for install, run, and test commands.
 
+Quality gates (also the git pre-commit hook via `make hooks`): `make test`, `make sast` (cppcheck on `src/`), `make vuln` (osv-scanner), `make secrets` (gitleaks), `make fmt-check` (clang-format). Aggregate: `make check`. Parallel Gitea jobs live in `.gitea/workflows/ci.yml`.
+
 ## Cursor Cloud specific instructions
 
 This repository is one sibling git remote in the carolina.codes polyglot fleet. Cloud agents should treat **this repo** as the workspace root. The Phoenix CMS is a different remote (`github.com/brightball/carolina-codes`); do not assume `../elixir` or other sibling directories exist unless those remotes are attached to the same Cloud environment.

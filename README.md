@@ -13,3 +13,19 @@ PUBLIC_BASE_URL=http://127.0.0.1:4009 \
 PORT=4009 \
 ./api
 ```
+
+## Quality gates
+
+Same commands locally, in the git pre-commit hook, and as parallel Gitea Actions jobs:
+
+```bash
+make test        # functionality (./perf_test)
+make sast        # cppcheck on first-party src/
+make vuln        # osv-scanner source scan (vendored C/C++)
+make secrets     # gitleaks
+make fmt-check   # clang-format --dry-run --Werror on src/
+make check       # all of the above (pre-commit aggregate)
+make hooks       # install .githooks/pre-commit (pre-commit runner + Makefile fallback)
+```
+
+Tools: `g++`, `cppcheck`, `osv-scanner`, `gitleaks`, `clang-format`. `make fmt` rewrites first-party sources.

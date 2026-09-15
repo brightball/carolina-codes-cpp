@@ -76,19 +76,29 @@ struct J {
     std::string o = "\"";
     for (const unsigned char *p = reinterpret_cast<const unsigned char *>(v); *p; ++p) {
       switch (*p) {
-        case '"': o += "\\\""; break;
-        case '\\': o += "\\\\"; break;
-        case '\n': o += "\\n"; break;
-        case '\r': o += "\\r"; break;
-        case '\t': o += "\\t"; break;
-        default:
-          if (*p < 0x20) {
-            char buf[8];
-            std::snprintf(buf, sizeof(buf), "\\u%04x", *p);
-            o += buf;
-          } else {
-            o += static_cast<char>(*p);
-          }
+      case '"':
+        o += "\\\"";
+        break;
+      case '\\':
+        o += "\\\\";
+        break;
+      case '\n':
+        o += "\\n";
+        break;
+      case '\r':
+        o += "\\r";
+        break;
+      case '\t':
+        o += "\\t";
+        break;
+      default:
+        if (*p < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", *p);
+          o += buf;
+        } else {
+          o += static_cast<char>(*p);
+        }
       }
     }
     o += '"';
@@ -414,7 +424,7 @@ std::string pg_text_array(const std::vector<std::string> &slugs) {
 }
 
 std::unordered_map<std::string, std::vector<int>> load_years_for_slugs(PGconn *c,
-                                                                      const std::vector<std::string> &slugs) {
+                                                                       const std::vector<std::string> &slugs) {
   std::unordered_map<std::string, std::vector<int>> by_slug;
   if (slugs.empty()) return by_slug;
   Res res = exec_params(c,
@@ -602,7 +612,7 @@ void register_with_elixir(const std::string &port) {
   }
 }
 
-}  // namespace
+} // namespace
 
 void carolina_init() {
   g_dsn = env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
