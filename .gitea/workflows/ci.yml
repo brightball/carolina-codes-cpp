@@ -1,9 +1,12 @@
 # One Gitea Actions job per quality-gate check. Not a single combined job.
 #
-# Prepare installs the shared toolset once, packs apt .debs + /usr/local, and
+# Prepare installs the shared toolset once (g++, ASan/UBSan runtimes, cppcheck,
+# osv-scanner, gitleaks, clang-format), packs apt .debs + /usr/local, and
 # publishes that tarball via the Gitea artifact v3 API (curl/python3, no Node).
 # Check jobs wait on prepare, clone GITHUB_SHA with the job token, restore the
 # packed environment, then run only their make target.
+# The test job also installs PostgreSQL so the suite can apply scripts/v1_fixture.sql.
+# The server package stays out of the shared tarball so other jobs skip its postinst.
 #
 # Empty debian image: clone GITHUB_SHA with the job token over HTTPS.
 # Gitea git HTTP returns 401 without the token.
@@ -31,7 +34,7 @@ jobs:
       - run: |
           rm -f /etc/apt/apt.conf.d/docker-clean
           apt-get update -qq
-          apt-get install -y --no-install-recommends git ca-certificates curl tar g++ make pkg-config libpq-dev cppcheck python3 python3-pip
+          apt-get install -y --no-install-recommends git ca-certificates curl tar g++ make pkg-config libpq-dev libasan8 libubsan1 cppcheck python3 python3-pip
       - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
@@ -59,7 +62,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get -y --no-install-recommends install git ca-certificates curl tar
+      - run: apt-get update -qq && apt-get -y --no-install-recommends install git ca-certificates curl tar postgresql
       - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi

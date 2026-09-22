@@ -10,6 +10,7 @@
 #include <libpq-fe.h>
 #endif
 
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -56,8 +57,8 @@ std::mutex g_db_mu;
 std::condition_variable g_db_cv;
 PGconn *g_pool[kPoolSize]{};
 bool g_busy[kPoolSize]{};
-int g_sql_count = 0;
-int g_connect_count = 0;
+std::atomic<int> g_sql_count{0};
+std::atomic<int> g_connect_count{0};
 PGconn *(*g_connect_fn)(const char *) = nullptr;
 
 std::string env_or(const char *key, const char *fallback) {
@@ -166,27 +167,33 @@ PGconn *do_connect() {
   return PQconnectdb(g_dsn.c_str());
 }
 
+// One new connection per acquire. A dead pool must not dial once per slot.
 PGconn *db_acquire() {
   std::unique_lock<std::mutex> lock(g_db_mu);
   for (;;) {
-    int busy = 0;
+    int slot = -1;
     for (int i = 0; i < kPoolSize; ++i) {
-      if (g_busy[i]) {
-        busy++;
-        continue;
-      }
-      if (!conn_ok(g_pool[i])) {
-        if (g_pool[i] && !g_connect_fn) PQfinish(g_pool[i]);
-        g_pool[i] = do_connect();
-      }
+      if (g_busy[i]) continue;
       if (conn_ok(g_pool[i])) {
         g_busy[i] = true;
         return g_pool[i];
       }
-      g_pool[i] = nullptr;
+      if (slot < 0) slot = i;
     }
-    if (busy == 0) return nullptr;
-    g_db_cv.wait(lock);
+    if (slot < 0) {
+      g_db_cv.wait(lock);
+      continue;
+    }
+    if (g_pool[slot] && !g_connect_fn) PQfinish(g_pool[slot]);
+    g_pool[slot] = nullptr;
+    PGconn *fresh = do_connect();
+    if (!conn_ok(fresh)) {
+      if (fresh && !g_connect_fn) PQfinish(fresh);
+      return nullptr;
+    }
+    g_pool[slot] = fresh;
+    g_busy[slot] = true;
+    return fresh;
   }
 }
 
@@ -619,13 +626,13 @@ void carolina_init() {
 }
 
 void carolina_reset_counts() {
-  g_sql_count = 0;
-  g_connect_count = 0;
+  g_sql_count.store(0);
+  g_connect_count.store(0);
 }
 
-int carolina_sql_count() { return g_sql_count; }
+int carolina_sql_count() { return g_sql_count.load(); }
 
-int carolina_connect_count() { return g_connect_count; }
+int carolina_connect_count() { return g_connect_count.load(); }
 
 void carolina_set_connect_fn(PGconn *(*fn)(const char *)) {
   db_reset_pool();
@@ -666,14 +673,18 @@ int carolina_bind_ipv6() {
   return port;
 }
 
-#ifndef CAROLINA_TEST
-int main() {
-  g_dsn = env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
-  std::string port_s = env_or("PORT", "4009");
-  int port = std::atoi(port_s.c_str());
-  if (port <= 0) port = 4009;
+namespace {
 
+struct ServeState {
   httplib::Server svr;
+  std::thread loop;
+  std::thread reg;
+  int port = -1;
+};
+
+ServeState *g_serve = nullptr;
+
+void install_routes(httplib::Server &svr) {
   svr.set_pre_routing_handler([](const httplib::Request &, httplib::Response &res) {
     res.set_header("X-Polyglot-Language", kLanguage);
     res.set_header("X-Polyglot-Framework", kFramework);
@@ -819,7 +830,51 @@ int main() {
     s += "}";
     send_json(res, wrap_data(J::raw_json(s)));
   });
+}
 
+} // namespace
+
+int carolina_serve_start() {
+  if (g_serve) return g_serve->port;
+  auto *st = new ServeState();
+  install_routes(st->svr);
+  st->port = st->svr.bind_to_any_port("::");
+  if (st->port < 0) {
+    delete st;
+    return -1;
+  }
+  st->loop = std::thread([st] { st->svr.listen_after_bind(); });
+  st->svr.wait_until_ready();
+  std::string port_s = std::to_string(st->port);
+  st->reg = std::thread([port_s] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    register_with_elixir(port_s);
+  });
+  g_serve = st;
+  return st->port;
+}
+
+void carolina_serve_stop() {
+  if (!g_serve) return;
+  g_serve->svr.stop();
+  if (g_serve->loop.joinable()) g_serve->loop.join();
+  if (g_serve->reg.joinable()) g_serve->reg.join();
+  ServeState *st = g_serve;
+  g_serve = nullptr;
+  delete st;
+}
+
+#ifndef CAROLINA_TEST
+int main() {
+  g_dsn = env_or("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
+  std::string port_s = env_or("PORT", "4009");
+  int port = std::atoi(port_s.c_str());
+  if (port <= 0) port = 4009;
+
+  httplib::Server svr;
+  install_routes(svr);
+
+  // Registration is off the listen thread so a black-hole CAROLINA_URL cannot stall /health.
   std::thread([port_s] {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     register_with_elixir(port_s);

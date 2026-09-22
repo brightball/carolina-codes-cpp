@@ -23,5 +23,7 @@ int carolina_listen_family();
 int carolina_handle_health_copy(char *buf, size_t buflen);
 int carolina_handle_speakers_year(int year, char *buf, size_t buflen);
 int carolina_bind_ipv6();
+int carolina_serve_start();
+void carolina_serve_stop();
 
 #endif

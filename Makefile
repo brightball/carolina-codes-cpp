@@ -1,12 +1,18 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread
-CPPFLAGS += -Ivendor
+# Vendor httplib.h is a system include so upstream warnings are outside -Werror.
+CPPFLAGS += -isystem vendor
 CPPFLAGS += $(shell pkg-config --cflags libpq 2>/dev/null)
 LDLIBS += $(shell pkg-config --libs libpq 2>/dev/null)
 ifeq ($(strip $(LDLIBS)),)
   LDLIBS += -lpq
 endif
 LDLIBS += -pthread
+
+# Fly binary: optimized and stripped. Sanitizers stay off this link (they slow cold start).
+PROD_CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Werror -pthread -g0 -s
+# Functional tests only. -Wno-maybe-uninitialized silences a libstdc++ regex
+# false positive that appears when sanitizers instrument httplib route patterns.
+TEST_CXXFLAGS := -std=c++17 -O2 -g -Wall -Wextra -Werror -Wno-maybe-uninitialized -pthread -fno-omit-frame-pointer -fsanitize=address,undefined
 
 CPPCHECK ?= cppcheck
 OSV_SCANNER ?= osv-scanner
@@ -20,13 +26,13 @@ need = command -v $(1) >/dev/null 2>&1 || { echo "missing $(1); install it to ru
 
 all: api
 
-api: src/main.cpp vendor/httplib.h
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ src/main.cpp $(LDLIBS)
+api: src/main.cpp src/carolina.h vendor/httplib.h
+	$(CXX) $(PROD_CXXFLAGS) $(CPPFLAGS) -o $@ src/main.cpp $(LDLIBS)
 
 perf_test: src/main.cpp src/perf_test.cpp src/carolina.h vendor/httplib.h
-	$(CXX) $(CXXFLAGS) -Wno-unused-function -Wno-unused-variable -DCAROLINA_TEST $(CPPFLAGS) -Isrc -o $@ src/main.cpp src/perf_test.cpp $(LDLIBS)
+	$(CXX) $(TEST_CXXFLAGS) -DCAROLINA_TEST $(CPPFLAGS) -Isrc -o $@ src/main.cpp src/perf_test.cpp $(LDLIBS)
 
-test: perf_test
+test: api perf_test
 	./perf_test
 
 # First-party src/ only. Findings in vendor/httplib.h are not this tree's to fix.

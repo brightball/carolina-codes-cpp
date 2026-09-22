@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /src/api /app/api
+RUN test ! -x /usr/bin/g++ && test ! -x /usr/bin/gcc && test ! -x /usr/bin/cc
 ENV PORT=8080
 EXPOSE 8080
 CMD ["/app/api"]
