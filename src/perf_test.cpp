@@ -357,6 +357,41 @@ static void test_quality_gate_wiring() {
   }
 }
 
+static std::string defined_c_string(const std::string &text, const char *macro) {
+  std::string needle = std::string("#define ") + macro + " \"";
+  auto at = text.find(needle);
+  if (at == std::string::npos) return {};
+  at += needle.size();
+  auto end = text.find('"', at);
+  if (end == std::string::npos) return {};
+  return text.substr(at, end - at);
+}
+
+static void test_shipped_docs() {
+  const std::string readme = slurp_file("README.md");
+  const std::string agents = slurp_file("AGENTS.md");
+  const std::string memory = slurp_file("MEMORY.md");
+  const std::string decisions = slurp_file("DECISIONS.md");
+  const std::string httplib = slurp_file("vendor/httplib.h");
+  std::string ver = defined_c_string(httplib, "CPPHTTPLIB_VERSION");
+  expect(!ver.empty(), "vendor/httplib.h defines CPPHTTPLIB_VERSION");
+  expect_contains(readme, "C++17", "README states C++17");
+  expect(!ver.empty() && readme.find(ver) != std::string::npos,
+         "README states the vendored cpp-httplib version");
+  expect_contains(readme, "libpq", "README names libpq");
+  expect(readme.find("CRaC") == std::string::npos && readme.find("crac") == std::string::npos,
+         "README does not claim CRaC");
+  expect_contains(agents, "v1_*", "AGENTS.md requires v1_* views");
+  expect_contains(agents, "Never query Ash", "AGENTS.md forbids Ash queries");
+  expect_contains(agents, "Register once on boot", "AGENTS.md requires register-once");
+  expect_contains(agents, "If `CAROLINA_URL` is empty or the POST fails, log and keep serving.",
+                  "AGENTS.md keeps serving when CAROLINA_URL is empty or the POST fails");
+  expect_contains(agents, "MEMORY.md", "AGENTS.md points at MEMORY.md");
+  expect_contains(agents, "DECISIONS.md", "AGENTS.md points at DECISIONS.md");
+  expect(!memory.empty(), "MEMORY.md is non-empty");
+  expect(!decisions.empty(), "DECISIONS.md is non-empty");
+}
+
 static bool pg_ok(PGconn *c) { return c && PQstatus(c) == CONNECTION_OK; }
 
 static bool pg_exec(PGconn *c, const char *sql) {
@@ -718,6 +753,7 @@ static void launch_api(int port, const std::string &dsn, const std::string &caro
 int main() {
   std::signal(SIGPIPE, SIG_IGN);
   test_quality_gate_wiring();
+  test_shipped_docs();
   expect(access("api", X_OK) == 0, "production api binary is executable");
 
   expect(carolina_listen_family() == AF_INET6, "listen family is AF_INET6");
